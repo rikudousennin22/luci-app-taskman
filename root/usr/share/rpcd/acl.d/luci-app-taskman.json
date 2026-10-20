@@ -1,0 +1,17 @@
+{
+	"luci-app-taskman": {
+		"description": "Grant access to taskman procedures",
+		"read": {
+			"ubus": {
+				"luci.taskman": [ "get_perf_stats" ],
+				"luci": [ "getProcessList" ],
+				"system": [ "info", "board" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.taskman": [ "kill_process", "toggle_fbstreamer" ]
+			}
+		}
+	}
+}

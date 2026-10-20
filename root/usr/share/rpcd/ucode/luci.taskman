@@ -1,0 +1,315 @@
+'use strict';
+
+import { open, readfile, stat, lsdir, popen } from 'fs';
+
+function read_file(path) {
+	let r = readfile(path);
+	return r ? trim(r) : null;
+}
+
+function parse_cpu_stat() {
+	let content = read_file('/proc/stat');
+	if (!content) return null;
+	
+	let lines = split(content, '\n');
+	let cpus = [];
+	let total = null;
+	
+	for (let line in lines) {
+		let parts = split(trim(line), /[ \t]+/);
+		if (!parts || length(parts) < 5) continue;
+		
+		let name = parts[0];
+		if (match(name, /^cpu[0-9]*$/)) {
+			let user = int(parts[1]) || 0;
+			let nice = int(parts[2]) || 0;
+			let system = int(parts[3]) || 0;
+			let idle = int(parts[4]) || 0;
+			let iowait = (length(parts) > 5) ? (int(parts[5]) || 0) : 0;
+			let irq = (length(parts) > 6) ? (int(parts[6]) || 0) : 0;
+			let softirq = (length(parts) > 7) ? (int(parts[7]) || 0) : 0;
+			let steal = (length(parts) > 8) ? (int(parts[8]) || 0) : 0;
+			
+			let busy = user + nice + system + irq + softirq + steal;
+			let total_jiffies = busy + idle + iowait;
+			
+			let obj = {
+				name: name,
+				busy: busy,
+				idle: idle + iowait,
+				total: total_jiffies,
+				user: user,
+				system: system,
+				iowait: iowait
+			};
+			
+			if (name == 'cpu') {
+				total = obj;
+			} else {
+				push(cpus, obj);
+			}
+		}
+	}
+	
+	return { total: total, cores: cpus };
+}
+
+function get_cpu_freqs() {
+	let freqs = [];
+	for (let i = 0; i < 6; i++) {
+		let cur = read_file(sprintf('/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq', i));
+		let max_f = read_file(sprintf('/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq', i));
+		let gov = read_file(sprintf('/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor', i));
+		push(freqs, {
+			core: i,
+			cur_khz: cur ? int(cur) : 0,
+			max_khz: max_f ? int(max_f) : 0,
+			governor: gov || 'unknown'
+		});
+	}
+	return freqs;
+}
+
+function get_thermal() {
+	let temp_str = read_file('/sys/class/thermal/thermal_zone0/temp');
+	if (!temp_str) return null;
+	let t = int(temp_str);
+	return {
+		raw: t,
+		celsius: (t > 1000) ? (t / 1000.0) : t
+	};
+}
+
+function get_detailed_mem() {
+	let content = read_file('/proc/meminfo');
+	if (!content) return null;
+	
+	let mem = {};
+	let lines = split(content, '\n');
+	for (let line in lines) {
+		let m = match(line, /^([A-Za-z0-9_()]+):\s*([0-9]+)\s*kB/);
+		if (m) {
+			mem[m[1]] = int(m[2]) * 1024; // in bytes
+		}
+	}
+	return mem;
+}
+
+function get_net_dev() {
+	let content = read_file('/proc/net/dev');
+	if (!content) return [];
+	
+	let lines = split(content, '\n');
+	let ifaces = [];
+	for (let i = 2; i < length(lines); i++) {
+		let line = trim(lines[i]);
+		if (!line) continue;
+		let colon = index(line, ':');
+		if (colon < 0) continue;
+		let ifname = trim(substr(line, 0, colon));
+		let stats_str = trim(substr(line, colon + 1));
+		let parts = split(stats_str, /[ \t]+/);
+		if (length(parts) >= 16) {
+			if (match(ifname, /^(tunl|sit|gre)/)) continue;
+			push(ifaces, {
+				ifname: ifname,
+				rx_bytes: int(parts[0]) || 0,
+				rx_packets: int(parts[1]) || 0,
+				rx_errors: int(parts[2]) || 0,
+				tx_bytes: int(parts[8]) || 0,
+				tx_packets: int(parts[9]) || 0,
+				tx_errors: int(parts[10]) || 0
+			});
+		}
+	}
+	return ifaces;
+}
+
+function get_disk_stats() {
+	let content = read_file('/proc/diskstats');
+	if (!content) return [];
+	
+	let lines = split(content, '\n');
+	let disks = [];
+	for (let line in lines) {
+		let parts = split(trim(line), /[ \t]+/);
+		if (length(parts) >= 14) {
+			let dev = parts[2];
+			if (dev == 'mmcblk0' || match(dev, /^sd[a-z]$/)) {
+				push(disks, {
+					device: dev,
+					reads_completed: int(parts[3]) || 0,
+					sectors_read: int(parts[5]) || 0,
+					read_bytes: (int(parts[5]) || 0) * 512,
+					writes_completed: int(parts[7]) || 0,
+					sectors_written: int(parts[9]) || 0,
+					write_bytes: (int(parts[9]) || 0) * 512,
+					io_ticks: int(parts[12]) || 0
+				});
+			}
+		}
+	}
+	return disks;
+}
+
+function get_drm_display() {
+	let drm_stat = stat('/sys/class/drm/card0');
+	if (!drm_stat) return null;
+	
+	let fb_running = false;
+	let fb_pid = null;
+	let pids = lsdir('/proc');
+	for (let p in pids) {
+		if (match(p, /^[0-9]+$/)) {
+			let comm = read_file(sprintf('/proc/%s/comm', p));
+			if (comm == 'fbstreamer') {
+				fb_running = true;
+				fb_pid = int(p);
+				break;
+			}
+		}
+	}
+	
+	let fb_enabled = (system('/etc/init.d/fbstreamer enabled 2>/dev/null') == 0);
+	
+	return {
+		card: 'card0',
+		driver: 'simpledrm',
+		driver_desc: 'SimpleDRM Hardware Framebuffer',
+		resolution: '1920x1080',
+		format: 'XR24 (32-bit RGB)',
+		pitch: 7680,
+		fb_memory_bytes: 7680 * 1080 * 4,
+		fbstreamer_active: fb_running,
+		fbstreamer_pid: fb_pid,
+		fbstreamer_enabled: fb_enabled,
+		port: 9999
+	};
+}
+
+function get_process_list() {
+	let p = popen('top -b -n 1');
+	if (!p) return [];
+	let out = p.read('all');
+	p.close();
+	if (!out) return [];
+	
+	let lines = split(trim(out), '\n');
+	let procs = [];
+	let start = false;
+	
+	for (let line in lines) {
+		let l = trim(line);
+		if (!start) {
+			if (match(l, /^PID\s+PPID/)) {
+				start = true;
+			}
+			continue;
+		}
+		
+		let parts = split(l, /[ \t]+/);
+		if (length(parts) < 8) continue;
+		
+		let pid = parts[0];
+		let ppid = parts[1];
+		let user = parts[2];
+		let stat = parts[3];
+		let vsz = parts[4];
+		let mem_pct = parts[5];
+		let cpu_pct = parts[6];
+		let cmd_parts = [];
+		for (let i = 7; i < length(parts); i++) {
+			push(cmd_parts, parts[i]);
+		}
+		let cmd = join(' ', cmd_parts);
+		
+		push(procs, {
+			PID: pid,
+			PPID: ppid,
+			USER: user,
+			STAT: stat,
+			VSZ: vsz,
+			'%MEM': mem_pct,
+			'%CPU': cpu_pct,
+			COMMAND: cmd
+		});
+	}
+	
+	return procs;
+}
+
+const methods = {
+	get_perf_stats: {
+		call: function() {
+			return {
+				time: time(),
+				cpu: parse_cpu_stat(),
+				cpu_freqs: get_cpu_freqs(),
+				thermal: get_thermal(),
+				mem: get_detailed_mem(),
+				net: get_net_dev(),
+				disks: get_disk_stats(),
+				gpu: get_drm_display(),
+				processes: get_process_list()
+			};
+		}
+	},
+	
+	kill_process: {
+		args: { pid: 0, signal: 15 },
+		call: function(req) {
+			let pid = int(req.args?.pid);
+			let sig = int(req.args?.signal) || 15;
+			
+			if (!pid || pid <= 1) {
+				return { success: false, error: 'Invalid or protected PID' };
+			}
+			
+			if (sig != 1 && sig != 9 && sig != 15) {
+				sig = 15;
+			}
+			
+			let res = system(sprintf('/bin/kill -%d %d 2>/dev/null', sig, pid));
+			return {
+				success: (res == 0),
+				pid: pid,
+				signal: sig
+			};
+		}
+	},
+
+	toggle_fbstreamer: {
+		args: { enable: true },
+		call: function(req) {
+			let to_enable = (req.args?.enable == true || req.args?.enable == 1 || req.args?.enable == '1' || req.args?.enable == 'true');
+			if (to_enable) {
+				system('/etc/init.d/fbstreamer enable 2>/dev/null');
+				system('/etc/init.d/fbstreamer start 2>/dev/null');
+			} else {
+				system('/etc/init.d/fbstreamer stop 2>/dev/null');
+				system('/etc/init.d/fbstreamer disable 2>/dev/null');
+				system('killall -9 fbstreamer 2>/dev/null');
+			}
+			
+			let fb_running = false;
+			let pids = lsdir('/proc');
+			for (let p in pids) {
+				if (match(p, /^[0-9]+$/)) {
+					let comm = read_file(sprintf('/proc/%s/comm', p));
+					if (comm == 'fbstreamer') {
+						fb_running = true;
+						break;
+					}
+				}
+			}
+			let fb_enabled = (system('/etc/init.d/fbstreamer enabled 2>/dev/null') == 0);
+			return {
+				success: true,
+				active: fb_running,
+				enabled: fb_enabled
+			};
+		}
+	}
+};
+
+return { 'luci.taskman': methods };
